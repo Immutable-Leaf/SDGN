@@ -9,6 +9,7 @@ Training
 
     python train.py --gpu 'your device id' --dataset 'sysu or regdb'
 
-Exa:
+Example
+
     python train.py --gpu 0 --dataset sysu
 
