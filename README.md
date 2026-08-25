@@ -7,6 +7,7 @@ Prepare Datasets
 
 Training
 We utilize 1 A100 GPU for training:
+
     python train.py --gpu 'your device id' --dataset 'sysu or regdb' 
 
 Example
