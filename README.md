@@ -6,6 +6,7 @@ Prepare Datasets
         run "python pre_process_sysu.py" to pepare the dataset, the training data will be stored in ".npy" format.
 
 Training
+
 We utilize 1 A100 GPU for training:
 
     python train.py --gpu 'your device id' --dataset 'sysu or regdb' 
