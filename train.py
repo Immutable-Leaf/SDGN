@@ -18,7 +18,7 @@ from model import embed_net
 from utils import *
 from loss import OriTripletLoss
 from random_erasing import RandomErasing, RandomLinear
-from cross_center_loss import cross_center_loss
+from TSC_loss import cross_center_loss
 
 
 parser = argparse.ArgumentParser(description='PyTorch Cross-Modality Training')
