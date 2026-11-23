@@ -14,14 +14,14 @@ class Normalize(nn.Module):
 
     def forward(self, x):
         norm = x.pow(self.power).sum(1, keepdim=True).pow(1. / self.power)
-        out = x.div(norm)
+        out = x.div(norm.clamp_min(1e-12))
         return out
 
 
-# #####################################################################
+
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
-    # print(classname)
+
     if classname.find('Conv') != -1:
         init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
     elif classname.find('Linear') != -1:
@@ -55,12 +55,12 @@ class SpatialAttention(nn.Module):
 
 
 class att_resnet(nn.Module):
-    def __init__(self, class_num, arch='resnet50'):
+    def __init__(self, class_num, arch='resnet50', pretrained=True):
         super(att_resnet, self).__init__()
 
-        model_base = resnet50(pretrained=True,
+        model_base = resnet50(pretrained=pretrained,
                               last_conv_stride=1, last_conv_dilation=1)
-        # avg pooling to global pooling
+
         model_base.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.base = model_base
         self.SA = SpatialAttention()
@@ -70,18 +70,18 @@ class att_resnet(nn.Module):
     def forward(self, x):
         f = self.base.layer4(x)
         x = torch.mul(x, self.sigmoid(torch.mean(f, dim=1, keepdim=True)))
-        f = torch.squeeze(self.base.avgpool(f))
+        f = self.base.avgpool(f).flatten(1)
         out, feat = self.classifier(f)
         return x, out, feat
 
 
 class base_resnet(nn.Module):
-    def __init__(self, arch='resnet50'):
+    def __init__(self, arch='resnet50', pretrained=True):
         super(base_resnet, self).__init__()
 
-        model_base = resnet50(pretrained=True,
+        model_base = resnet50(pretrained=pretrained,
                               last_conv_stride=1, last_conv_dilation=1)
-        # avg pooling to global pooling
+
         model_base.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.base = model_base
 
@@ -91,8 +91,8 @@ class base_resnet(nn.Module):
         x = self.base.relu(x)
         x = self.base.maxpool(x)
         xL1 = self.base.layer1(x)
-        xL2 = self.base.layer2(xL1)      # (B,512,48,24)
-        xL3 = self.base.layer3(xL2)      # (B,1024,24,12)
+        xL2 = self.base.layer2(xL1)
+        xL3 = self.base.layer3(xL2)
         return xL1, xL2, xL3
 
 
@@ -136,106 +136,131 @@ class classifier(nn.Module):
         for i in range(self.part):
             name = 'classifier_' + str(i)
             cls_part = getattr(self, name)
-            out_all[i + start_point], feat_all[i + start_point] = cls_part(torch.squeeze(x[:, :, i]))
+            out_all[i + start_point], feat_all[i + start_point] = cls_part(x[:, :, i].flatten(1))
             feat_all[i + start_point] = self.l2norm(feat_all[i + start_point])
 
         return feat_all, out_all
 
 
-class L1ToL2Adaptor(nn.Module):
+class SDMA(nn.Module):
 
-    def __init__(self):
+    def __init__(self, shallow_channels, deep_channels, num_experts=4):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, 1)
+        self.num_experts = num_experts
+        group_channels = shallow_channels // num_experts
+        output_channels = deep_channels // num_experts
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(group_channels, group_channels, 3, padding=1),
+                nn.BatchNorm2d(group_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(group_channels, output_channels, 1),
+            )
+            for _ in range(num_experts)
+        ])
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(shallow_channels, num_experts, 1),
+            nn.Softmax(dim=1),
         )
+
+    def forward(self, x, target_size):
+        x_group = x.chunk(self.num_experts, dim=1)
+        gate = self.gate(x)
+        weight = []
+        for i, expert in enumerate(self.experts):
+            x = expert(x_group[i])
+            x = F.adaptive_avg_pool2d(x, target_size)
+            w = torch.sigmoid(x)
+            w = self.num_experts * gate[:, i:i + 1] * w
+            weight.append(w)
+        weight = torch.cat(weight, dim=1)
+        return weight
+
+
+class L1ToL2Adaptor(SDMA):
+    def __init__(self, num_experts=4):
+        super().__init__(256, 512, num_experts)
 
     def forward(self, xL1, target_size):
-        # xL1: (B,256,96,48)
-        x = self.conv(xL1)                         # (B,512,96,48)
-        x = F.adaptive_avg_pool2d(x, target_size)  # (B,512,48,24)
-        weight = torch.sigmoid(x)
-        return weight
+        return super().forward(xL1, target_size)
 
 
-
-class L2ToL3Adaptor(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 1024, 1)   
-        )
+class L2ToL3Adaptor(SDMA):
+    def __init__(self, num_experts=4):
+        super().__init__(512, 1024, num_experts)
 
     def forward(self, xL2, target_size):
-                                                   # xL2: (B,512,48,24)
-        x = self.conv(xL2)                         # (B,1024,48,24)
-        x = F.adaptive_avg_pool2d(x, target_size)  # (B,1024,24,12)
-        weight = torch.sigmoid(x)     
-        return weight
+        return super().forward(xL2, target_size)
+
 
 class embed_net(nn.Module):
-    def __init__(self, class_num, part, arch='resnet50'):
+    def __init__(self, class_num, part, arch='resnet50',
+                 num_experts=4, pretrained=True):
         super(embed_net, self).__init__()
 
         self.part = int(part)
-        self.base_resnet = base_resnet(arch=arch)
-        self.att_v = att_resnet(class_num)
-        self.att_n = att_resnet(class_num)
+        self.alpha1 = 0.3
+        self.alpha2 = 0.3
+        self.base_resnet = base_resnet(arch=arch, pretrained=pretrained)
+        self.att_v = att_resnet(class_num, arch=arch, pretrained=pretrained)
+        self.att_n = att_resnet(class_num, arch=arch, pretrained=pretrained)
         self.classifier = classifier(self.part, class_num)
 
         self.l2norm = Normalize(2)
         self.avgpool = nn.AdaptiveAvgPool2d((self.part, 1))
-        self.adaptor12_v = L1ToL2Adaptor()
-        self.adaptor12_n = L1ToL2Adaptor()
-        self.adaptor23_v = L2ToL3Adaptor()
-        self.adaptor23_n = L2ToL3Adaptor()
+        self.adaptor12_v = L1ToL2Adaptor(num_experts)
+        self.adaptor12_n = L1ToL2Adaptor(num_experts)
+        self.adaptor23_v = L2ToL3Adaptor(num_experts)
+        self.adaptor23_n = L2ToL3Adaptor(num_experts)
 
 
 
     def forward(self, x1, x2, modal=0):
         if modal == 0:
-            x = torch.cat((x1, x2), 0)                    # (2B,3,384,192)
-            xL1, xL2, xL3 = self.base_resnet(x)           # xL2: (2B,512,48,24), xL3: (2B,1024,24,12)
+            batch_v, batch_n = x1.size(0), x2.size(0)
+            x = torch.cat((x1, x2), 0)
+            xL1, xL2, xL3 = self.base_resnet(x)
 
-            # L1->L2
-            xL1_v, xL1_n = torch.chunk(xL1, 2, 0)
-            xL2_v, xL2_n = torch.chunk(xL2, 2, 0)
+
+            xL1_v, xL1_n = xL1.split((batch_v, batch_n), dim=0)
+            xL2_v, xL2_n = xL2.split((batch_v, batch_n), dim=0)
             w_v12 = self.adaptor12_v(xL1_v, xL2_v.shape[-2:])
             w_n12 = self.adaptor12_n(xL1_n, xL2_n.shape[-2:])
-            xL2_v = xL2_v * (1 + 0.3 * w_v12)
-            xL2_n = xL2_n * (1 + 0.3 * w_n12)
+            xL2_v = xL2_v * (1 + self.alpha1 * w_v12)
+            xL2_n = xL2_n * (1 + self.alpha1 * w_n12)
 
-            # L2->L3
-            xL3_v, xL3_n = torch.chunk(xL3, 2, 0)
+
+            xL3_v, xL3_n = xL3.split((batch_v, batch_n), dim=0)
             w_v23 = self.adaptor23_v(xL2_v, xL3_v.shape[-2:])
             w_n23 = self.adaptor23_n(xL2_n, xL3_n.shape[-2:])
-            xL3_v = xL3_v * (1 + 0.3 * w_v23)
-            xL3_n = xL3_n * (1 + 0.3 * w_n23)
+            xL3_v = xL3_v * (1 + self.alpha2 * w_v23)
+            xL3_n = xL3_n * (1 + self.alpha2 * w_n23)
 
-            # L4
+
             x1_att, out_v, feat_v = self.att_v(xL3_v)
             x2_att, out_n, feat_n = self.att_n(xL3_n)
 
-            # 拼接并池化
-            x = torch.cat((x1_att, x2_att), 0)            # (2B,1024,24,12)
-
-            # 构造全局特征和全局输出（与原 model.py 保持一致）
-            feat_globe = torch.cat((feat_v, feat_n), 0)   # (2B,512)
-            out_globe = torch.cat((out_v, out_n), 0)      # (2B,class_num)
+            x = torch.cat((x1_att, x2_att), 0)
+            feat_globe = torch.cat((feat_v, feat_n), 0)
+            out_globe = torch.cat((out_v, out_n), 0)
 
         elif modal == 1:
             xL1, xL2, xL3 = self.base_resnet(x1)
+            w_v12 = self.adaptor12_v(xL1, xL2.shape[-2:])
+            xL2 = xL2 * (1 + self.alpha1 * w_v12)
+            w_v23 = self.adaptor23_v(xL2, xL3.shape[-2:])
+            xL3 = xL3 * (1 + self.alpha2 * w_v23)
             x, _, _ = self.att_v(xL3)
 
         elif modal == 2:
             xL1, xL2, xL3 = self.base_resnet(x2)
+            w_n12 = self.adaptor12_n(xL1, xL2.shape[-2:])
+            xL2 = xL2 * (1 + self.alpha1 * w_n12)
+            w_n23 = self.adaptor23_n(xL2, xL3.shape[-2:])
+            xL3 = xL3 * (1 + self.alpha2 * w_n23)
             x, _, _ = self.att_n(xL3)
+
 
         x = self.avgpool(x)
         feat = {}
@@ -246,9 +271,5 @@ class embed_net(nn.Module):
                 feat, out, feat_globe, out_globe,
             )
         else:
-            for i in range(self.part):
-                if i == 0:
-                    featf = feat[i]
-                else:
-                    featf = torch.cat((featf, feat[i]), 1)
+            featf = torch.cat([feat[i] for i in range(self.part)], 1)
             return featf
